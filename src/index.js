@@ -2,18 +2,21 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
 //  ALXMOVIES PROXY — Cloudflare Worker (com Auth Supabase)
+//  v2.1 — Tudo passa pelo proxy. Auth obrigatória excepto
+//  nas rotas de login/registo e imagens TMDB.
 // ═══════════════════════════════════════════════════════════
 
-// URL do teu projeto Supabase
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
-// JWKS endpoint (chaves públicas para validar JWTs)
 const JWKS = createRemoteJWKSet(
   new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`)
 );
 
 const ORIGINS = {
+  // ── Streaming / extracao ──
   "alx":  { target: "https://alx-api.onrender.com" },
   "jney": { target: "https://api-alex-jney.onrender.com" },
+
+  // ── Supabase ──
   "sb": {
     target: "https://onqxflwfkexitipylixc.supabase.co",
     headers: { "apikey": "env:SUPABASE_PUBLISHABLE_KEY" }
@@ -25,33 +28,30 @@ const ORIGINS = {
       "Authorization": "env:SUPABASE_PUBLISHABLE_KEY"
     }
   },
-  "sb-auth":    { target: "https://onqxflwfkexitipylixc.supabase.co/auth/v1" },
-  "sb-fn":      { target: "https://onqxflwfkexitipylixc.supabase.co/functions/v1" },
+  "sb-auth": { target: "https://onqxflwfkexitipylixc.supabase.co/auth/v1" },
+  "sb-fn":   { target: "https://onqxflwfkexitipylixc.supabase.co/functions/v1" },
   "sb-storage": {
     target: "https://onqxflwfkexitipylixc.supabase.co/storage/v1",
     headers: { "apikey": "env:SUPABASE_PUBLISHABLE_KEY" }
   },
+
+  // ── Netlify Functions ──
   "canais": { target: "https://alx-player.netlify.app/.netlify/functions/canais", exact: true },
   "epg":    { target: "https://alx-player.netlify.app/.netlify/functions/programacao", exact: true },
-  "release": {
-    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest",
-    exact: true
-  },
-  "releases": {
-    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases",
-    exact: true
-  },
-  "repo": {
-    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv",
-    exact: true
-  },
-  "tmdb": {
-    target: "https://image.tmdb.org/t/p"
-  }
+
+  // ── GitHub ──
+  "release":  { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest", exact: true },
+  "releases": { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases", exact: true },
+  "repo":     { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv", exact: true },
+
+  // ── TMDB ──
+  "tmdb": { target: "https://image.tmdb.org/t/p" }
 };
 
-// Rotas que NÃO precisam de autenticação (ex: imagens TMDB, health check)
-const PUBLIC_PREFIXES = ["tmdb"];
+// ─── Rotas públicas (não exigem JWT) ─────────────────────
+// sb-auth: login/signup/refresh — o utilizador ainda não tem JWT
+// tmdb: imagens — sem dados sensíveis
+const PUBLIC_ROUTES = ["sb-auth", "tmdb"];
 
 const BLOCKED_HOSTS = [
   /^localhost$/i, /^127\./, /^0\./, /^10\./, /^192\.168\./,
@@ -60,7 +60,7 @@ const BLOCKED_HOSTS = [
 
 const rateBuckets = new Map();
 
-// ─── Verifica o JWT do Supabase ─────────────────────────────
+// ─── Verificação do JWT ─────────────────────────────────
 async function verifySupabaseJWT(request) {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -69,7 +69,7 @@ async function verifySupabaseJWT(request) {
 
   const token = authHeader.substring(7);
 
-  // A publishable key NÃO é um JWT — não a tentar validar como token
+  // Publishable key não é JWT — rejeitar explicitamente
   if (token.startsWith("sb_") || token.length < 30) {
     return { ok: false, reason: "not_a_jwt" };
   }
@@ -81,7 +81,6 @@ async function verifySupabaseJWT(request) {
     });
     return { ok: true, user: payload };
   } catch (err) {
-    console.error("JWT validation failed:", err.message);
     return { ok: false, reason: "invalid_token", detail: err.message };
   }
 }
@@ -98,56 +97,56 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
 
-    // ─── Rota raiz: índice (público) ───
+    // ─── Raiz: índice (público) ───
     if (parts.length === 0) {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.0.0-auth",
-        routes: Object.keys(ORIGINS)
+        version: "2.1.0-auth-full",
+        routes: Object.keys(ORIGINS),
+        publicRoutes: PUBLIC_ROUTES
       }, 200, env, request);
     }
 
     const prefix = parts[0];
+    const config = ORIGINS[prefix];
 
-    // ─── Verificar se a rota é pública ───
-    const isPublic = PUBLIC_PREFIXES.includes(prefix);
+    // ─── Prefixo inválido ───
+    if (!config) {
+      log(id, "NOT_FOUND:" + prefix, ip(request), 404, Date.now() - start);
+      return json({ error: 'Prefixo "' + prefix + '" nao configurado' }, 404, env, request);
+    }
+
+    // ─── Path traversal ───
+    if (url.pathname.includes("..")) {
+      return json({ error: "Bad Request" }, 400, env, request);
+    }
+
+    // ─── Verificar auth ───
+    const isPublic = PUBLIC_ROUTES.includes(prefix);
+    let userId = null;
 
     if (!isPublic) {
-      // ─── AUTH: só utilizadores com JWT válido do Supabase passam ───
       const auth = await verifySupabaseJWT(request);
       if (!auth.ok) {
         log(id, "AUTH_DENY:" + auth.reason, ip(request), 401, Date.now() - start);
         return json({
           error: "Unauthorized",
           reason: auth.reason,
-          hint: "Envia um JWT válido do Supabase no header Authorization: Bearer <token>"
+          hint: "Faz login em POST /sb-auth/token?grant_type=password para obter um JWT"
         }, 401, env, request);
       }
-      // Guarda o ID do utilizador para logs e rate limit
-      request.userId = auth.user.sub;
+      userId = auth.user.sub;
     }
 
     try {
-      // ─── Rate limit ───
+      // ─── Rate limit (por utilizador se autenticado, senão por IP) ───
       const clientIp = ip(request);
-      const rlKey = request.userId || clientIp; // Por utilizador, se autenticado
+      const rlKey = userId || clientIp;
       const rl = checkRateLimit(rlKey, Number(env.RATE_LIMIT_PER_MIN) || 120);
       if (!rl.ok) {
         log(id, "RATE_LIMIT", rlKey, 429, Date.now() - start);
         return json({ error: "Too Many Requests", retryAfter: rl.retryAfter }, 429, env, request);
-      }
-
-      // ─── Path traversal ───
-      if (url.pathname.includes("..")) {
-        return json({ error: "Bad Request" }, 400, env, request);
-      }
-
-      // ─── Validacao de prefixo ───
-      const config = ORIGINS[prefix];
-      if (!config) {
-        log(id, "NOT_FOUND:" + prefix, clientIp, 404, Date.now() - start);
-        return json({ error: 'Prefixo "' + prefix + '" nao configurado' }, 404, env, request);
       }
 
       // ─── Métodos permitidos ───
@@ -180,14 +179,14 @@ export default {
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip"].forEach(h => headers.delete(h));
-      headers.set("x-proxy-by", "alx-proxy/2.0");
+      headers.set("x-proxy-by", "alx-proxy/2.1");
 
       // GitHub API exige User-Agent
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.0");
+        headers.set("user-agent", "alx-proxy/2.1");
       }
 
-      // Injeta headers fixos (env:...)
+      // ─── Headers fixos do serviço (env:VAR) ───
       if (config.headers) {
         for (const [k, v] of Object.entries(config.headers)) {
           const resolved = (typeof v === "string" && v.startsWith("env:"))
@@ -196,7 +195,7 @@ export default {
         }
       }
 
-      // ─── Timeout de upstream ───
+      // ─── Timeout ───
       const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || 25000;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -225,7 +224,7 @@ export default {
       newHeaders.set("x-content-type-options", "nosniff");
       newHeaders.set("referrer-policy", "no-referrer");
 
-      log(id, prefix, request.userId || clientIp, response.status, Date.now() - start);
+      log(id, prefix, userId || clientIp, response.status, Date.now() - start);
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -303,8 +302,6 @@ function log(id, route, key, status, ms) {
   const short = key === "unknown" ? key : key.split(".").slice(0, 2).join(".") + ".x.x";
   console.log(JSON.stringify({
     t: new Date().toISOString(),
-    id, route,
-    key: short,
-    status, ms
+    id, route, key: short, status, ms
   }));
 }
