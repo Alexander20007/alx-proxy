@@ -4,9 +4,21 @@
 // ═══════════════════════════════════════════════════════════
 
 const ORIGINS = {
+  // ── Streaming / extracao ──
   "alx":  { target: "https://alx-api.onrender.com" },
   "jney": { target: "https://api-alex-jney.onrender.com" },
 
+  // ── Supabase — prefixo unico (para supabase-js) ──
+  // Mapeia o host inteiro: /sb/<servico>/<rota>
+  // Ex: /sb/rest/v1/tabela  ->  https://<proj>.supabase.co/rest/v1/tabela
+  "sb": {
+    target: "https://onqxflwfkexitipylixc.supabase.co",
+    headers: {
+      "apikey": "env:SUPABASE_PUBLISHABLE_KEY"
+    }
+  },
+
+  // ── Supabase — prefixos separados (uso direto via curl/app) ──
   "sb-rest": {
     target: "https://onqxflwfkexitipylixc.supabase.co/rest/v1",
     headers: {
@@ -21,12 +33,28 @@ const ORIGINS = {
     headers: { "apikey": "env:SUPABASE_PUBLISHABLE_KEY" }
   },
 
+  // ── Netlify Functions ──
   "canais": { target: "https://alx-player.netlify.app/.netlify/functions/canais", exact: true },
   "epg":    { target: "https://alx-player.netlify.app/.netlify/functions/programacao", exact: true },
 
+  // ── GitHub ──
   "release": {
     target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest",
     exact: true
+  },
+  "releases": {
+    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases",
+    exact: true
+  },
+  "repo": {
+    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv",
+    exact: true
+  },
+
+  // ── TMDB (imagens) ──
+  "tmdb": {
+    target: "https://image.tmdb.org/t/p",
+    // Ex: /tmdb/w500/abc.jpg  ->  https://image.tmdb.org/t/p/w500/abc.jpg
   }
 };
 
@@ -50,11 +78,13 @@ export default {
     const start = Date.now();
     const id = crypto.randomUUID().slice(0, 8);
 
+    // ── CORS preflight ──
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
 
     try {
+      // ── Rate limit por IP ──
       const ip = request.headers.get("cf-connecting-ip") || "unknown";
       const rl = checkRateLimit(ip, Number(env.RATE_LIMIT_PER_MIN) || 120);
       if (!rl.ok) {
@@ -65,21 +95,24 @@ export default {
       const url = new URL(request.url);
       const parts = url.pathname.split("/").filter(Boolean);
 
+      // ── Path traversal ──
       if (url.pathname.includes("..")) {
         log(id, "TRAVERSAL", ip, 400, Date.now() - start);
         return json({ error: "Bad Request" }, 400, env, request);
       }
 
+      // ── Rota raiz: indice ──
       if (parts.length === 0) {
         log(id, "INDEX", ip, 200, Date.now() - start);
         return json({
           service: "ALXMOVIES Proxy",
           status: "online",
-          version: "1.0.0",
+          version: "1.1.0",
           routes: Object.keys(ORIGINS)
         }, 200, env, request);
       }
 
+      // ── Validacao de prefixo ──
       const prefix = parts[0];
       const config = ORIGINS[prefix];
       if (!config) {
@@ -87,12 +120,14 @@ export default {
         return json({ error: 'Prefixo "' + prefix + '" nao configurado' }, 404, env, request);
       }
 
-      const allowed = config.methods || ["GET", "POST", "PUT", "DELETE", "HEAD"];
+      // ── Metodos permitidos ──
+      const allowed = config.methods || ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
       if (!allowed.includes(request.method)) {
         log(id, "METHOD:" + request.method, ip, 405, Date.now() - start);
         return json({ error: "Method Not Allowed" }, 405, env, request);
       }
 
+      // ── Tamanho maximo do body ──
       const maxBody = Number(env.MAX_BODY_BYTES) || 1048576;
       const contentLength = Number(request.headers.get("content-length") || 0);
       if (contentLength > maxBody) {
@@ -100,6 +135,7 @@ export default {
         return json({ error: "Payload Too Large" }, 413, env, request);
       }
 
+      // ── Constroi URL de destino ──
       let targetUrl;
       if (config.exact) {
         targetUrl = new URL(config.target + url.search);
@@ -108,18 +144,26 @@ export default {
         targetUrl = new URL(rest + url.search, config.target);
       }
 
+      // ── Bloqueio SSRF ──
       if (isBlockedHost(targetUrl.hostname)) {
         log(id, "SSRF_BLOCK", ip, 403, Date.now() - start);
         return json({ error: "Forbidden" }, 403, env, request);
       }
 
+      // ── Headers ──
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip"].forEach(function (h) {
         headers.delete(h);
       });
-      headers.set("x-proxy-by", "alx-proxy/1.0");
+      headers.set("x-proxy-by", "alx-proxy/1.1");
 
+      // GitHub API exige User-Agent
+      if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
+        headers.set("user-agent", "alx-proxy/1.1");
+      }
+
+      // ── Headers fixos do servico ──
       if (config.headers) {
         for (const [k, v] of Object.entries(config.headers)) {
           const resolved = (typeof v === "string" && v.startsWith("env:"))
@@ -129,10 +173,12 @@ export default {
         }
       }
 
+      // ── Timeout de upstream ──
       const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || 25000;
       const controller = new AbortController();
       const timeoutId = setTimeout(function () { controller.abort(); }, timeoutMs);
 
+      // ── Pedido upstream ──
       const proxyReq = new Request(targetUrl.toString(), {
         method: request.method,
         headers: headers,
@@ -148,6 +194,7 @@ export default {
         clearTimeout(timeoutId);
       }
 
+      // ── Resposta ──
       const newHeaders = new Headers(response.headers);
       const ch = corsHeaders(env, request);
       for (const [k, v] of Object.entries(ch)) {
@@ -176,6 +223,10 @@ export default {
   }
 };
 
+// ═══════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════
+
 function corsHeaders(env, request) {
   const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean);
   const origin = request && request.headers ? (request.headers.get("origin") || "") : "";
@@ -189,7 +240,7 @@ function corsHeaders(env, request) {
   }
   return {
     "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,HEAD,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS",
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
