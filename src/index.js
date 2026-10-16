@@ -1,9 +1,8 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
-//  ALXMOVIES PROXY — Cloudflare Worker (com Auth Supabase)
-//  v2.1 — Tudo passa pelo proxy. Auth obrigatória excepto
-//  nas rotas de login/registo e imagens TMDB.
+//  ALXMOVIES PROXY — Cloudflare Worker
+//  v2.2 — auth obrigatória, mensagens genéricas ao cliente
 // ═══════════════════════════════════════════════════════════
 
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
@@ -12,11 +11,9 @@ const JWKS = createRemoteJWKSet(
 );
 
 const ORIGINS = {
-  // ── Streaming / extracao ──
   "alx":  { target: "https://alx-api.onrender.com" },
   "jney": { target: "https://api-alex-jney.onrender.com" },
 
-  // ── Supabase ──
   "sb": {
     target: "https://onqxflwfkexitipylixc.supabase.co",
     headers: { "apikey": "env:SUPABASE_PUBLISHABLE_KEY" }
@@ -35,22 +32,17 @@ const ORIGINS = {
     headers: { "apikey": "env:SUPABASE_PUBLISHABLE_KEY" }
   },
 
-  // ── Netlify Functions ──
   "canais": { target: "https://alx-player.netlify.app/.netlify/functions/canais", exact: true },
   "epg":    { target: "https://alx-player.netlify.app/.netlify/functions/programacao", exact: true },
 
-  // ── GitHub ──
   "release":  { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest", exact: true },
   "releases": { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases", exact: true },
   "repo":     { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv", exact: true },
 
-  // ── TMDB ──
   "tmdb": { target: "https://image.tmdb.org/t/p" }
 };
 
-// ─── Rotas públicas (não exigem JWT) ─────────────────────
-// sb-auth: login/signup/refresh — o utilizador ainda não tem JWT
-// tmdb: imagens — sem dados sensíveis
+// Rotas que NÃO exigem JWT (login/signup/refresh + imagens)
 const PUBLIC_ROUTES = ["sb-auth", "tmdb"];
 
 const BLOCKED_HOSTS = [
@@ -60,7 +52,7 @@ const BLOCKED_HOSTS = [
 
 const rateBuckets = new Map();
 
-// ─── Verificação do JWT ─────────────────────────────────
+// ─── Validação do JWT Supabase ─────────────────────────────
 async function verifySupabaseJWT(request) {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -69,7 +61,6 @@ async function verifySupabaseJWT(request) {
 
   const token = authHeader.substring(7);
 
-  // Publishable key não é JWT — rejeitar explicitamente
   if (token.startsWith("sb_") || token.length < 30) {
     return { ok: false, reason: "not_a_jwt" };
   }
@@ -83,6 +74,18 @@ async function verifySupabaseJWT(request) {
   } catch (err) {
     return { ok: false, reason: "invalid_token", detail: err.message };
   }
+}
+
+// ─── Resposta genérica de "acesso negado" ──────────────────
+// Sem pistas para quem está a fazer engenharia reversa.
+function accessDenied(env, request) {
+  return new Response("Acesso negado", {
+    status: 401,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      ...corsHeaders(env, request)
+    }
+  });
 }
 
 export default {
@@ -102,7 +105,7 @@ export default {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.1.0-auth-full",
+        version: "2.2.0",
         routes: Object.keys(ORIGINS),
         publicRoutes: PUBLIC_ROUTES
       }, 200, env, request);
@@ -111,15 +114,28 @@ export default {
     const prefix = parts[0];
     const config = ORIGINS[prefix];
 
-    // ─── Prefixo inválido ───
+    // ─── Prefixo inválido → resposta genérica ───
     if (!config) {
       log(id, "NOT_FOUND:" + prefix, ip(request), 404, Date.now() - start);
-      return json({ error: 'Prefixo "' + prefix + '" nao configurado' }, 404, env, request);
+      return new Response("Acesso negado", {
+        status: 404,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          ...corsHeaders(env, request)
+        }
+      });
     }
 
-    // ─── Path traversal ───
+    // ─── Path traversal → resposta genérica ───
     if (url.pathname.includes("..")) {
-      return json({ error: "Bad Request" }, 400, env, request);
+      log(id, "TRAVERSAL", ip(request), 400, Date.now() - start);
+      return new Response("Acesso negado", {
+        status: 400,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          ...corsHeaders(env, request)
+        }
+      });
     }
 
     // ─── Verificar auth ───
@@ -130,35 +146,50 @@ export default {
       const auth = await verifySupabaseJWT(request);
       if (!auth.ok) {
         log(id, "AUTH_DENY:" + auth.reason, ip(request), 401, Date.now() - start);
-        return json({
-          error: "Unauthorized",
-          reason: auth.reason,
-          hint: "Faz login em POST /sb-auth/token?grant_type=password para obter um JWT"
-        }, 401, env, request);
+        return accessDenied(env, request);
       }
       userId = auth.user.sub;
     }
 
     try {
-      // ─── Rate limit (por utilizador se autenticado, senão por IP) ───
+      // ─── Rate limit ───
       const clientIp = ip(request);
       const rlKey = userId || clientIp;
       const rl = checkRateLimit(rlKey, Number(env.RATE_LIMIT_PER_MIN) || 120);
       if (!rl.ok) {
         log(id, "RATE_LIMIT", rlKey, 429, Date.now() - start);
-        return json({ error: "Too Many Requests", retryAfter: rl.retryAfter }, 429, env, request);
+        return new Response("Acesso negado", {
+          status: 429,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            ...corsHeaders(env, request)
+          }
+        });
       }
 
       // ─── Métodos permitidos ───
       const allowed = config.methods || ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
       if (!allowed.includes(request.method)) {
-        return json({ error: "Method Not Allowed" }, 405, env, request);
+        log(id, "METHOD:" + request.method, clientIp, 405, Date.now() - start);
+        return new Response("Acesso negado", {
+          status: 405,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            ...corsHeaders(env, request)
+          }
+        });
       }
 
-      // ─── Tamanho máximo do body ───
+      // ─── Tamanho do body ───
       const maxBody = Number(env.MAX_BODY_BYTES) || 1048576;
       if (Number(request.headers.get("content-length") || 0) > maxBody) {
-        return json({ error: "Payload Too Large" }, 413, env, request);
+        return new Response("Acesso negado", {
+          status: 413,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            ...corsHeaders(env, request)
+          }
+        });
       }
 
       // ─── Constroi URL de destino ───
@@ -172,21 +203,25 @@ export default {
 
       // ─── Bloqueio SSRF ───
       if (isBlockedHost(targetUrl.hostname)) {
-        return json({ error: "Forbidden" }, 403, env, request);
+        return new Response("Acesso negado", {
+          status: 403,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            ...corsHeaders(env, request)
+          }
+        });
       }
 
       // ─── Headers ───
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip"].forEach(h => headers.delete(h));
-      headers.set("x-proxy-by", "alx-proxy/2.1");
+      headers.set("x-proxy-by", "alx-proxy/2.2");
 
-      // GitHub API exige User-Agent
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.1");
+        headers.set("user-agent", "alx-proxy/2.2");
       }
 
-      // ─── Headers fixos do serviço (env:VAR) ───
       if (config.headers) {
         for (const [k, v] of Object.entries(config.headers)) {
           const resolved = (typeof v === "string" && v.startsWith("env:"))
@@ -234,11 +269,13 @@ export default {
     } catch (err) {
       const isTimeout = err.name === "AbortError";
       log(id, isTimeout ? "TIMEOUT" : "ERROR", "?", isTimeout ? 504 : 502, Date.now() - start);
-      return json(
-        { error: isTimeout ? "Gateway Timeout" : "Bad Gateway", detail: err.message },
-        isTimeout ? 504 : 502,
-        env, request
-      );
+      return new Response("Acesso negado", {
+        status: isTimeout ? 504 : 502,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          ...corsHeaders(env, request)
+        }
+      });
     }
   }
 };
