@@ -2,7 +2,7 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
 //  ALXMOVIES PROXY — Cloudflare Worker
-//  v2.4.0 — auth + nonce + WebSocket + release publico
+//  v2.4.1 — auth + nonce + WebSocket + GitHub token
 // ═══════════════════════════════════════════════════════════
 
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
@@ -36,14 +36,25 @@ const ORIGINS = {
   "canais": { target: "https://alx-player.netlify.app/.netlify/functions/canais", exact: true },
   "epg":    { target: "https://alx-player.netlify.app/.netlify/functions/programacao", exact: true },
 
-  "release":  { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest", exact: true },
-  "releases": { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases", exact: true },
-  "repo":     { target: "https://api.github.com/repos/Alexander20007/alxmovies-tv", exact: true },
+  "release":  {
+    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest",
+    exact: true,
+    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.4.1" }
+  },
+  "releases": {
+    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases",
+    exact: true,
+    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.4.1" }
+  },
+  "repo": {
+    target: "https://api.github.com/repos/Alexander20007/alxmovies-tv",
+    exact: true,
+    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.4.1" }
+  },
 
   "tmdb": { target: "https://image.tmdb.org/t/p" }
 };
 
-// Rotas publicas (sem JWT, sem nonce)
 const PUBLIC_ROUTES = ["sb-auth", "tmdb", "release", "releases", "repo"];
 
 const NONCE_TTL_SECONDS = 300;
@@ -99,17 +110,14 @@ export default {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
-    // ─── CORS preflight ───
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
 
-    // ─── WEBSOCKET /ws/realtime (supabase realtime via proxy) ───
     if (parts[0] === "ws" && parts[1] === "realtime") {
       return handleWebSocket(request, env, url);
     }
 
-    // ─── /nonce (publico) ───
     if (parts.length === 1 && parts[0] === "nonce" && request.method === "GET") {
       const nonce = generateNonce();
       const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000;
@@ -125,16 +133,14 @@ export default {
       return json({ nonce, expiresIn: NONCE_TTL_SECONDS }, 200, env, request);
     }
 
-    // ─── Raiz (publico) ───
     if (parts.length === 0) {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.4.0",
+        version: "2.4.1",
         routes: Object.keys(ORIGINS),
         publicRoutes: PUBLIC_ROUTES,
-        websocket: "/ws/realtime?token=<jwt>",
-        note: "Obtem um nonce em GET /nonce antes de fazer pedidos autenticados."
+        websocket: "/ws/realtime?token=<jwt>"
       }, 200, env, request);
     }
 
@@ -150,7 +156,6 @@ export default {
       return accessDenied(env, request, 400);
     }
 
-    // ─── Auth + nonce ───
     const isPublic = PUBLIC_ROUTES.includes(prefix);
     let userId = null;
 
@@ -210,7 +215,6 @@ export default {
         return accessDenied(env, request, 413);
       }
 
-      // ─── Constroi URL de destino (preserva path do target) ───
       let targetUrl;
       if (config.exact) {
         targetUrl = new URL(config.target + url.search);
@@ -224,7 +228,6 @@ export default {
         return accessDenied(env, request, 403);
       }
 
-      // ─── Headers ───
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip",
@@ -235,16 +238,23 @@ export default {
         headers.delete("authorization");
       }
 
-      headers.set("x-proxy-by", "alx-proxy/2.4");
+      headers.set("x-proxy-by", "alx-proxy/2.4.1");
 
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.4");
+        headers.set("user-agent", "alx-proxy/2.4.1");
       }
 
       if (config.headers) {
         for (const [k, v] of Object.entries(config.headers)) {
-          const resolved = (typeof v === "string" && v.startsWith("env:"))
-            ? env[v.slice(4)] : v;
+          let resolved = v;
+          if (typeof v === "string") {
+            if (v.startsWith("env:")) {
+              resolved = env[v.slice(4)];
+            } else if (v.startsWith("Bearer env:")) {
+              const key = v.slice(11);
+              resolved = `Bearer ${env[key] || ""}`;
+            }
+          }
           if (resolved) headers.set(k, resolved);
         }
       }
@@ -290,23 +300,16 @@ export default {
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// WebSocket handler (proxy para Supabase Realtime)
-// ═══════════════════════════════════════════════════════════
-
 async function handleWebSocket(request, env, url) {
-  // Verifica se e WebSocket upgrade
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Esperado WebSocket", { status: 400 });
   }
 
-  // Token vem como query string (browsers nao permitem headers em WS)
   const token = url.searchParams.get("token");
   if (!token) {
     return new Response("Acesso negado", { status: 401 });
   }
 
-  // Valida o JWT
   try {
     await jwtVerify(token, JWKS, {
       issuer: `${SUPABASE_URL}/auth/v1`,
@@ -316,15 +319,12 @@ async function handleWebSocket(request, env, url) {
     return new Response("Acesso negado", { status: 401 });
   }
 
-  // Monta URL do Supabase Realtime
   const supaPath = url.pathname.replace(/^\/ws\/realtime/, "/realtime/v1");
   const apiKey = env.SUPABASE_PUBLISHABLE_KEY || "";
   const supaUrl = new URL(`${SUPABASE_WS}${supaPath}`);
   supaUrl.searchParams.set("apikey", apiKey);
-  // Preserva o token original para o Supabase validar a sessao
   supaUrl.searchParams.set("access_token", token);
 
-  // Abre ligacao WebSocket ao Supabase
   const supabaseResponse = await fetch(supaUrl.toString(), {
     headers: { Upgrade: "websocket" }
   });
@@ -333,24 +333,18 @@ async function handleWebSocket(request, env, url) {
     return new Response("Falha ao ligar ao Supabase Realtime", { status: 502 });
   }
 
-  // Cria par WebSocket
   const [client, server] = Object.values(new WebSocketPair());
   server.accept();
 
   const supabaseWs = supabaseResponse.webSocket;
   supabaseWs.accept();
 
-  // Reencaminha mensagens cliente <-> supabase
   server.addEventListener("message", (event) => {
-    try {
-      supabaseWs.send(event.data);
-    } catch (e) {}
+    try { supabaseWs.send(event.data); } catch (e) {}
   });
 
   supabaseWs.addEventListener("message", (event) => {
-    try {
-      server.send(event.data);
-    } catch (e) {}
+    try { server.send(event.data); } catch (e) {}
   });
 
   server.addEventListener("close", () => {
@@ -367,12 +361,7 @@ async function handleWebSocket(request, env, url) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════
-
 function corsHeaders(env, request) {
-  // Inclui capacitor://localhost e file:// para WebView
   const defaults = "https://alxmovies.netlify.app,https://alx-player.netlify.app,capacitor://localhost,http://localhost,file://";
   const allowed = ((env.ALLOWED_ORIGINS || defaults) + "," + defaults)
     .split(",").map(s => s.trim()).filter(Boolean);
