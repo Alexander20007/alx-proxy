@@ -207,8 +207,9 @@ export default {
       if (config.exact) {
         targetUrl = new URL(config.target + url.search);
       } else {
-        const rest = "/" + parts.slice(1).join("/");
-        targetUrl = new URL(rest + url.search, config.target);
+        const rest = parts.slice(1).join("/");
+        const base = config.target.endsWith("/") ? config.target : config.target + "/";
+        targetUrl = new URL(base + rest + url.search);
       }
 
       if (isBlockedHost(targetUrl.hostname)) {
