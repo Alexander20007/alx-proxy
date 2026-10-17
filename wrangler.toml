@@ -12,3 +12,7 @@ ALLOWED_ORIGINS = "https://alxmovies.netlify.app,https://alx-player.netlify.app"
 RATE_LIMIT_PER_MIN = "120"
 MAX_BODY_BYTES = "1048576"
 UPSTREAM_TIMEOUT_MS = "25000"
+
+[[kv_namespaces]]
+binding = "NONCE_STORE"
+id = "9e4b5d5c14d94f018da7accade483467"

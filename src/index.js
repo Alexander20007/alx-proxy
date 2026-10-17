@@ -2,7 +2,7 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
 //  ALXMOVIES PROXY — Cloudflare Worker
-//  v2.2 — auth obrigatória, mensagens genéricas ao cliente
+//  v2.3 — auth + nonce por sessão (proteção contra mods)
 // ═══════════════════════════════════════════════════════════
 
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
@@ -42,8 +42,11 @@ const ORIGINS = {
   "tmdb": { target: "https://image.tmdb.org/t/p" }
 };
 
-// Rotas que NÃO exigem JWT (login/signup/refresh + imagens)
+// Rotas que NÃO exigem JWT nem nonce
 const PUBLIC_ROUTES = ["sb-auth", "tmdb"];
+
+const NONCE_TTL_SECONDS = 300;
+const NONCE_HEADER = "X-Nonce";
 
 const BLOCKED_HOSTS = [
   /^localhost$/i, /^127\./, /^0\./, /^10\./, /^192\.168\./,
@@ -52,19 +55,21 @@ const BLOCKED_HOSTS = [
 
 const rateBuckets = new Map();
 
-// ─── Validação do JWT Supabase ─────────────────────────────
+function generateNonce() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function verifySupabaseJWT(request) {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return { ok: false, reason: "missing_token" };
   }
-
   const token = authHeader.substring(7);
-
   if (token.startsWith("sb_") || token.length < 30) {
     return { ok: false, reason: "not_a_jwt" };
   }
-
   try {
     const { payload } = await jwtVerify(token, JWKS, {
       issuer: `${SUPABASE_URL}/auth/v1`,
@@ -76,11 +81,9 @@ async function verifySupabaseJWT(request) {
   }
 }
 
-// ─── Resposta genérica de "acesso negado" ──────────────────
-// Sem pistas para quem está a fazer engenharia reversa.
-function accessDenied(env, request) {
+function accessDenied(env, request, status = 401) {
   return new Response("Acesso negado", {
-    status: 401,
+    status,
     headers: {
       "content-type": "text/plain; charset=utf-8",
       ...corsHeaders(env, request)
@@ -95,104 +98,111 @@ export default {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
-    // ─── CORS preflight ───
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
 
-    // ─── Raiz: índice (público) ───
+    // ─── Endpoint /nonce (público) ───
+    if (parts.length === 1 && parts[0] === "nonce" && request.method === "GET") {
+      const nonce = generateNonce();
+      const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000;
+      try {
+        await env.NONCE_STORE.put(`nonce:${nonce}`, JSON.stringify({
+          created: Date.now(), expiresAt
+        }), { expirationTtl: NONCE_TTL_SECONDS });
+      } catch (err) {
+        console.error("KV put failed:", err.message);
+        return accessDenied(env, request, 500);
+      }
+      log(id, "NONCE_ISSUED", ip(request), 200, Date.now() - start);
+      return json({ nonce, expiresIn: NONCE_TTL_SECONDS }, 200, env, request);
+    }
+
     if (parts.length === 0) {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.2.0",
+        version: "2.3.0",
         routes: Object.keys(ORIGINS),
-        publicRoutes: PUBLIC_ROUTES
+        publicRoutes: PUBLIC_ROUTES,
+        note: "Obtém um nonce em GET /nonce antes de fazer pedidos autenticados."
       }, 200, env, request);
     }
 
     const prefix = parts[0];
     const config = ORIGINS[prefix];
 
-    // ─── Prefixo inválido → resposta genérica ───
     if (!config) {
       log(id, "NOT_FOUND:" + prefix, ip(request), 404, Date.now() - start);
-      return new Response("Acesso negado", {
-        status: 404,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          ...corsHeaders(env, request)
-        }
-      });
+      return accessDenied(env, request, 404);
     }
 
-    // ─── Path traversal → resposta genérica ───
     if (url.pathname.includes("..")) {
-      log(id, "TRAVERSAL", ip(request), 400, Date.now() - start);
-      return new Response("Acesso negado", {
-        status: 400,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          ...corsHeaders(env, request)
-        }
-      });
+      return accessDenied(env, request, 400);
     }
 
-    // ─── Verificar auth ───
     const isPublic = PUBLIC_ROUTES.includes(prefix);
     let userId = null;
 
     if (!isPublic) {
+      // ─── Valida JWT ───
       const auth = await verifySupabaseJWT(request);
       if (!auth.ok) {
         log(id, "AUTH_DENY:" + auth.reason, ip(request), 401, Date.now() - start);
-        return accessDenied(env, request);
+        return accessDenied(env, request, 401);
       }
       userId = auth.user.sub;
+
+      // ─── Valida nonce ───
+      const nonce = request.headers.get(NONCE_HEADER);
+      if (!nonce) {
+        log(id, "NONCE_MISSING", userId, 401, Date.now() - start);
+        return accessDenied(env, request, 401);
+      }
+
+      const key = `nonce:${nonce}`;
+      let stored;
+      try {
+        stored = await env.NONCE_STORE.get(key);
+      } catch (err) {
+        console.error("KV get failed:", err.message);
+        return accessDenied(env, request, 500);
+      }
+
+      if (!stored) {
+        log(id, "NONCE_INVALID:" + nonce.slice(0, 8), userId, 401, Date.now() - start);
+        return accessDenied(env, request, 401);
+      }
+
+      // uso único — apaga
+      try {
+        await env.NONCE_STORE.delete(key);
+      } catch (err) {
+        console.error("KV delete failed:", err.message);
+      }
+
+      log(id, "NONCE_OK:" + nonce.slice(0, 8), userId, 200, Date.now() - start);
     }
 
     try {
-      // ─── Rate limit ───
       const clientIp = ip(request);
       const rlKey = userId || clientIp;
       const rl = checkRateLimit(rlKey, Number(env.RATE_LIMIT_PER_MIN) || 120);
       if (!rl.ok) {
         log(id, "RATE_LIMIT", rlKey, 429, Date.now() - start);
-        return new Response("Acesso negado", {
-          status: 429,
-          headers: {
-            "content-type": "text/plain; charset=utf-8",
-            ...corsHeaders(env, request)
-          }
-        });
+        return accessDenied(env, request, 429);
       }
 
-      // ─── Métodos permitidos ───
       const allowed = config.methods || ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
       if (!allowed.includes(request.method)) {
-        log(id, "METHOD:" + request.method, clientIp, 405, Date.now() - start);
-        return new Response("Acesso negado", {
-          status: 405,
-          headers: {
-            "content-type": "text/plain; charset=utf-8",
-            ...corsHeaders(env, request)
-          }
-        });
+        return accessDenied(env, request, 405);
       }
 
-      // ─── Tamanho do body ───
       const maxBody = Number(env.MAX_BODY_BYTES) || 1048576;
       if (Number(request.headers.get("content-length") || 0) > maxBody) {
-        return new Response("Acesso negado", {
-          status: 413,
-          headers: {
-            "content-type": "text/plain; charset=utf-8",
-            ...corsHeaders(env, request)
-          }
-        });
+        return accessDenied(env, request, 413);
       }
 
-      // ─── Constroi URL de destino ───
       let targetUrl;
       if (config.exact) {
         targetUrl = new URL(config.target + url.search);
@@ -201,25 +211,18 @@ export default {
         targetUrl = new URL(rest + url.search, config.target);
       }
 
-      // ─── Bloqueio SSRF ───
       if (isBlockedHost(targetUrl.hostname)) {
-        return new Response("Acesso negado", {
-          status: 403,
-          headers: {
-            "content-type": "text/plain; charset=utf-8",
-            ...corsHeaders(env, request)
-          }
-        });
+        return accessDenied(env, request, 403);
       }
 
-      // ─── Headers ───
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
-       "x-forwarded-for", "x-forwarded-proto", "x-real-ip"].forEach(h => headers.delete(h));
-      headers.set("x-proxy-by", "alx-proxy/2.2");
+       "x-forwarded-for", "x-forwarded-proto", "x-real-ip",
+       NONCE_HEADER.toLowerCase()].forEach(h => headers.delete(h));
+      headers.set("x-proxy-by", "alx-proxy/2.3");
 
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.2");
+        headers.set("user-agent", "alx-proxy/2.3");
       }
 
       if (config.headers) {
@@ -230,12 +233,10 @@ export default {
         }
       }
 
-      // ─── Timeout ───
       const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || 25000;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-      // ─── Pedido upstream ───
       const proxyReq = new Request(targetUrl.toString(), {
         method: request.method,
         headers,
@@ -251,7 +252,6 @@ export default {
         clearTimeout(timeoutId);
       }
 
-      // ─── Resposta ───
       const newHeaders = new Headers(response.headers);
       for (const [k, v] of Object.entries(corsHeaders(env, request))) {
         newHeaders.set(k, v);
@@ -269,20 +269,10 @@ export default {
     } catch (err) {
       const isTimeout = err.name === "AbortError";
       log(id, isTimeout ? "TIMEOUT" : "ERROR", "?", isTimeout ? 504 : 502, Date.now() - start);
-      return new Response("Acesso negado", {
-        status: isTimeout ? 504 : 502,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          ...corsHeaders(env, request)
-        }
-      });
+      return accessDenied(env, request, isTimeout ? 504 : 502);
     }
   }
 };
-
-// ═══════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════
 
 function corsHeaders(env, request) {
   const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
