@@ -2,7 +2,7 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
 //  ALXMOVIES PROXY — Cloudflare Worker
-//  v2.3 — auth + nonce por sessão (proteção contra mods)
+//  v2.3.1 — auth + nonce + correção de headers (GitHub)
 // ═══════════════════════════════════════════════════════════
 
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
@@ -55,12 +55,14 @@ const BLOCKED_HOSTS = [
 
 const rateBuckets = new Map();
 
+// ─── Gera nonce aleatorio ───
 function generateNonce() {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ─── Valida JWT do Supabase ───
 async function verifySupabaseJWT(request) {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -81,6 +83,7 @@ async function verifySupabaseJWT(request) {
   }
 }
 
+// ─── Resposta generica ───
 function accessDenied(env, request, status = 401) {
   return new Response("Acesso negado", {
     status,
@@ -98,11 +101,12 @@ export default {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
+    // ─── CORS preflight ───
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
 
-    // ─── Endpoint /nonce (público) ───
+    // ─── /nonce (publico) ───
     if (parts.length === 1 && parts[0] === "nonce" && request.method === "GET") {
       const nonce = generateNonce();
       const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000;
@@ -118,14 +122,15 @@ export default {
       return json({ nonce, expiresIn: NONCE_TTL_SECONDS }, 200, env, request);
     }
 
+    // ─── Raiz (publico) ───
     if (parts.length === 0) {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.3.0",
+        version: "2.3.1",
         routes: Object.keys(ORIGINS),
         publicRoutes: PUBLIC_ROUTES,
-        note: "Obtém um nonce em GET /nonce antes de fazer pedidos autenticados."
+        note: "Obtem um nonce em GET /nonce antes de fazer pedidos autenticados."
       }, 200, env, request);
     }
 
@@ -141,11 +146,11 @@ export default {
       return accessDenied(env, request, 400);
     }
 
+    // ─── Auth + nonce ───
     const isPublic = PUBLIC_ROUTES.includes(prefix);
     let userId = null;
 
     if (!isPublic) {
-      // ─── Valida JWT ───
       const auth = await verifySupabaseJWT(request);
       if (!auth.ok) {
         log(id, "AUTH_DENY:" + auth.reason, ip(request), 401, Date.now() - start);
@@ -153,7 +158,6 @@ export default {
       }
       userId = auth.user.sub;
 
-      // ─── Valida nonce ───
       const nonce = request.headers.get(NONCE_HEADER);
       if (!nonce) {
         log(id, "NONCE_MISSING", userId, 401, Date.now() - start);
@@ -174,7 +178,6 @@ export default {
         return accessDenied(env, request, 401);
       }
 
-      // uso único — apaga
       try {
         await env.NONCE_STORE.delete(key);
       } catch (err) {
@@ -203,6 +206,7 @@ export default {
         return accessDenied(env, request, 413);
       }
 
+      // ─── Constroi URL de destino (preserva path do target) ───
       let targetUrl;
       if (config.exact) {
         targetUrl = new URL(config.target + url.search);
@@ -216,14 +220,23 @@ export default {
         return accessDenied(env, request, 403);
       }
 
+      // ─── Headers ───
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip",
        NONCE_HEADER.toLowerCase()].forEach(h => headers.delete(h));
-      headers.set("x-proxy-by", "alx-proxy/2.3");
+
+      // Remove Authorization para destinos NAO-Supabase
+      // (o JWT do Supabase nao e valido no GitHub, TMDB, etc.)
+      const isSupabase = targetUrl.hostname.includes("supabase.co");
+      if (!isSupabase) {
+        headers.delete("authorization");
+      }
+
+      headers.set("x-proxy-by", "alx-proxy/2.3.1");
 
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.3");
+        headers.set("user-agent", "alx-proxy/2.3.1");
       }
 
       if (config.headers) {
@@ -234,6 +247,7 @@ export default {
         }
       }
 
+      // ─── Timeout ───
       const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || 25000;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -274,6 +288,10 @@ export default {
     }
   }
 };
+
+// ═══════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════
 
 function corsHeaders(env, request) {
   const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
