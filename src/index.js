@@ -2,7 +2,7 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
 //  ALXMOVIES PROXY — Cloudflare Worker
-//  v2.4.1 — auth + nonce + WebSocket + GitHub token
+//  v2.5.0 — auth + nonce + WebSocket + rotas publicas condicionais
 // ═══════════════════════════════════════════════════════════
 
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
@@ -11,9 +11,12 @@ const JWKS = createRemoteJWKSet(
   new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`)
 );
 
+// ─── Configuracao base ───
 const ORIGINS = {
-  "alx":  { target: "https://alx-api.onrender.com" },
-  "jney": { target: "https://api-alex-jney.onrender.com" },
+  "alx":   { target: "https://alx-api.onrender.com" },
+  "alxm":  { target: "https://alx-api.onrender.com" },
+  "jney":  { target: "https://api-alex-jney.onrender.com" },
+  "jneym": { target: "https://api-alex-jney.onrender.com" },
 
   "sb": {
     target: "https://onqxflwfkexitipylixc.supabase.co",
@@ -39,23 +42,40 @@ const ORIGINS = {
   "release":  {
     target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases/latest",
     exact: true,
-    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.4.1" }
+    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.5.0" }
   },
   "releases": {
     target: "https://api.github.com/repos/Alexander20007/alxmovies-tv/releases",
     exact: true,
-    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.4.1" }
+    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.5.0" }
   },
   "repo": {
     target: "https://api.github.com/repos/Alexander20007/alxmovies-tv",
     exact: true,
-    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.4.1" }
+    headers: { "Authorization": "Bearer env:GITHUB_TOKEN", "User-Agent": "alx-proxy/2.5.0" }
   },
 
   "tmdb": { target: "https://image.tmdb.org/t/p" }
 };
 
+// ─── Rotas completamente publicas (sem JWT, sem nonce) ───
 const PUBLIC_ROUTES = ["sb-auth", "tmdb", "release", "releases", "repo"];
+
+// ─── Rotas com "allowPaths": publicas so em paths especificos ───
+// O player HLS.js e o 1DM nao enviam headers, por isso estes paths
+// precisam de ser publicos. O resto do prefixo continua protegido.
+const ALLOW_PATHS = {
+  // /alxm/api/proxy e /alxm/api/proxy/... sao publicos
+  "alxm": ["api/proxy"],
+  "alx":  ["api/proxy"],
+  "jneym": ["proxy"],
+  "jney":  ["proxy"]
+};
+
+// ─── Prefixos que tem um rate limit especifico ───
+const RATE_LIMIT_OVERRIDES = {
+  "sb-fn-guest-redeem": 10   // 10/min por IP
+};
 
 const NONCE_TTL_SECONDS = 300;
 const NONCE_HEADER = "X-Nonce";
@@ -114,10 +134,12 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
     }
 
+    // ─── WebSocket ───
     if (parts[0] === "ws" && parts[1] === "realtime") {
       return handleWebSocket(request, env, url);
     }
 
+    // ─── /nonce ───
     if (parts.length === 1 && parts[0] === "nonce" && request.method === "GET") {
       const nonce = generateNonce();
       const expiresAt = Date.now() + NONCE_TTL_SECONDS * 1000;
@@ -133,14 +155,16 @@ export default {
       return json({ nonce, expiresIn: NONCE_TTL_SECONDS }, 200, env, request);
     }
 
+    // ─── Raiz ───
     if (parts.length === 0) {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.4.1",
+        version: "2.5.0",
         routes: Object.keys(ORIGINS),
         publicRoutes: PUBLIC_ROUTES,
-        websocket: "/ws/realtime?token=<jwt>"
+        allowPaths: ALLOW_PATHS,
+        websocket: "/ws/realtime?token=<jwt>&apikey=<key>&vsn=1.0.0"
       }, 200, env, request);
     }
 
@@ -156,7 +180,27 @@ export default {
       return accessDenied(env, request, 400);
     }
 
-    const isPublic = PUBLIC_ROUTES.includes(prefix);
+    // ─── Verificar se o pedido e "path publico" ───
+    const rest = parts.slice(1).join("/");
+    const isPathPublic = (ALLOW_PATHS[prefix] || []).some(p =>
+      rest === p || rest.startsWith(p + "/") || rest.startsWith(p + "?")
+    );
+
+    // ─── Rotas "parcialmente publicas": /sb-storage e /sb-fn ───
+    // Essas nao entram no ALLOW_PATHS porque dependem do path especifico.
+    let isPublic = PUBLIC_ROUTES.includes(prefix) || isPathPublic;
+
+    // /sb-storage/object/public/* e publico (GET/HEAD)
+    if (prefix === "sb-storage" && rest.startsWith("object/public/") && ["GET", "HEAD"].includes(request.method)) {
+      isPublic = true;
+    }
+
+    // POST /sb-fn/guest-redeem-code e publico (com rate limit 10/min por IP)
+    const isGuestRedeem = (prefix === "sb-fn" && rest === "guest-redeem-code" && request.method === "POST");
+    if (isGuestRedeem) {
+      isPublic = true;
+    }
+
     let userId = null;
 
     if (!isPublic) {
@@ -197,9 +241,12 @@ export default {
     }
 
     try {
+      // ─── Rate limit (com override) ───
       const clientIp = ip(request);
       const rlKey = userId || clientIp;
-      const rl = checkRateLimit(rlKey, Number(env.RATE_LIMIT_PER_MIN) || 120);
+      const defaultMax = Number(env.RATE_LIMIT_PER_MIN) || 300;
+      const maxPerMin = isGuestRedeem ? RATE_LIMIT_OVERRIDES["sb-fn-guest-redeem"] : defaultMax;
+      const rl = checkRateLimit(rlKey, maxPerMin);
       if (!rl.ok) {
         log(id, "RATE_LIMIT", rlKey, 429, Date.now() - start);
         return accessDenied(env, request, 429);
@@ -215,11 +262,11 @@ export default {
         return accessDenied(env, request, 413);
       }
 
+      // ─── URL de destino ───
       let targetUrl;
       if (config.exact) {
         targetUrl = new URL(config.target + url.search);
       } else {
-        const rest = parts.slice(1).join("/");
         const base = config.target.endsWith("/") ? config.target : config.target + "/";
         targetUrl = new URL(base + rest + url.search);
       }
@@ -228,6 +275,7 @@ export default {
         return accessDenied(env, request, 403);
       }
 
+      // ─── Headers ───
       const headers = new Headers(request.headers);
       ["host", "cf-connecting-ip", "cf-ray", "cf-worker", "cf-ipcountry",
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip",
@@ -238,10 +286,10 @@ export default {
         headers.delete("authorization");
       }
 
-      headers.set("x-proxy-by", "alx-proxy/2.4.1");
+      headers.set("x-proxy-by", "alx-proxy/2.5.0");
 
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.4.1");
+        headers.set("user-agent", "alx-proxy/2.5.0");
       }
 
       if (config.headers) {
@@ -300,6 +348,10 @@ export default {
   }
 };
 
+// ═══════════════════════════════════════════════════════════
+// WebSocket handler (repassa token, apikey e vsn ao Supabase)
+// ═══════════════════════════════════════════════════════════
+
 async function handleWebSocket(request, env, url) {
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Esperado WebSocket", { status: 400 });
@@ -319,10 +371,14 @@ async function handleWebSocket(request, env, url) {
     return new Response("Acesso negado", { status: 401 });
   }
 
-  const supaPath = url.pathname.replace(/^\/ws\/realtime/, "/realtime/v1");
-  const apiKey = env.SUPABASE_PUBLISHABLE_KEY || "";
+  // Repassa TODOS os query params para o Supabase (token, apikey, vsn, etc.)
+  const supaPath = url.pathname.replace(/^\/ws\/realtime/, "/realtime/v1/websocket");
+  const apiKey = env.SUPABASE_PUBLISHABLE_KEY || url.searchParams.get("apikey") || "";
+  const vsn = url.searchParams.get("vsn") || "1.0.0";
+
   const supaUrl = new URL(`${SUPABASE_WS}${supaPath}`);
   supaUrl.searchParams.set("apikey", apiKey);
+  supaUrl.searchParams.set("vsn", vsn);
   supaUrl.searchParams.set("access_token", token);
 
   const supabaseResponse = await fetch(supaUrl.toString(), {
@@ -360,6 +416,10 @@ async function handleWebSocket(request, env, url) {
     webSocket: client
   });
 }
+
+// ═══════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════
 
 function corsHeaders(env, request) {
   const defaults = "https://alxmovies.netlify.app,https://alx-player.netlify.app,capacitor://localhost,http://localhost,file://";
