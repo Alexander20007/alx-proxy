@@ -2,10 +2,11 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // ═══════════════════════════════════════════════════════════
 //  ALXMOVIES PROXY — Cloudflare Worker
-//  v2.3.1 — auth + nonce + correção de headers (GitHub)
+//  v2.4.0 — auth + nonce + WebSocket + release publico
 // ═══════════════════════════════════════════════════════════
 
 const SUPABASE_URL = "https://onqxflwfkexitipylixc.supabase.co";
+const SUPABASE_WS = "wss://onqxflwfkexitipylixc.supabase.co";
 const JWKS = createRemoteJWKSet(
   new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`)
 );
@@ -42,8 +43,8 @@ const ORIGINS = {
   "tmdb": { target: "https://image.tmdb.org/t/p" }
 };
 
-// Rotas que NÃO exigem JWT nem nonce
-const PUBLIC_ROUTES = ["sb-auth", "tmdb"];
+// Rotas publicas (sem JWT, sem nonce)
+const PUBLIC_ROUTES = ["sb-auth", "tmdb", "release", "releases", "repo"];
 
 const NONCE_TTL_SECONDS = 300;
 const NONCE_HEADER = "X-Nonce";
@@ -55,14 +56,12 @@ const BLOCKED_HOSTS = [
 
 const rateBuckets = new Map();
 
-// ─── Gera nonce aleatorio ───
 function generateNonce() {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// ─── Valida JWT do Supabase ───
 async function verifySupabaseJWT(request) {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -83,7 +82,6 @@ async function verifySupabaseJWT(request) {
   }
 }
 
-// ─── Resposta generica ───
 function accessDenied(env, request, status = 401) {
   return new Response("Acesso negado", {
     status,
@@ -104,6 +102,11 @@ export default {
     // ─── CORS preflight ───
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(env, request) });
+    }
+
+    // ─── WEBSOCKET /ws/realtime (supabase realtime via proxy) ───
+    if (parts[0] === "ws" && parts[1] === "realtime") {
+      return handleWebSocket(request, env, url);
     }
 
     // ─── /nonce (publico) ───
@@ -127,9 +130,10 @@ export default {
       return json({
         service: "ALXMOVIES Proxy",
         status: "online",
-        version: "2.3.1",
+        version: "2.4.0",
         routes: Object.keys(ORIGINS),
         publicRoutes: PUBLIC_ROUTES,
+        websocket: "/ws/realtime?token=<jwt>",
         note: "Obtem um nonce em GET /nonce antes de fazer pedidos autenticados."
       }, 200, env, request);
     }
@@ -226,17 +230,15 @@ export default {
        "x-forwarded-for", "x-forwarded-proto", "x-real-ip",
        NONCE_HEADER.toLowerCase()].forEach(h => headers.delete(h));
 
-      // Remove Authorization para destinos NAO-Supabase
-      // (o JWT do Supabase nao e valido no GitHub, TMDB, etc.)
       const isSupabase = targetUrl.hostname.includes("supabase.co");
       if (!isSupabase) {
         headers.delete("authorization");
       }
 
-      headers.set("x-proxy-by", "alx-proxy/2.3.1");
+      headers.set("x-proxy-by", "alx-proxy/2.4");
 
       if (targetUrl.hostname === "api.github.com" && !headers.has("user-agent")) {
-        headers.set("user-agent", "alx-proxy/2.3.1");
+        headers.set("user-agent", "alx-proxy/2.4");
       }
 
       if (config.headers) {
@@ -247,7 +249,6 @@ export default {
         }
       }
 
-      // ─── Timeout ───
       const timeoutMs = Number(env.UPSTREAM_TIMEOUT_MS) || 25000;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -290,17 +291,98 @@ export default {
 };
 
 // ═══════════════════════════════════════════════════════════
+// WebSocket handler (proxy para Supabase Realtime)
+// ═══════════════════════════════════════════════════════════
+
+async function handleWebSocket(request, env, url) {
+  // Verifica se e WebSocket upgrade
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("Esperado WebSocket", { status: 400 });
+  }
+
+  // Token vem como query string (browsers nao permitem headers em WS)
+  const token = url.searchParams.get("token");
+  if (!token) {
+    return new Response("Acesso negado", { status: 401 });
+  }
+
+  // Valida o JWT
+  try {
+    await jwtVerify(token, JWKS, {
+      issuer: `${SUPABASE_URL}/auth/v1`,
+      audience: "authenticated"
+    });
+  } catch (err) {
+    return new Response("Acesso negado", { status: 401 });
+  }
+
+  // Monta URL do Supabase Realtime
+  const supaPath = url.pathname.replace(/^\/ws\/realtime/, "/realtime/v1");
+  const apiKey = env.SUPABASE_PUBLISHABLE_KEY || "";
+  const supaUrl = new URL(`${SUPABASE_WS}${supaPath}`);
+  supaUrl.searchParams.set("apikey", apiKey);
+  // Preserva o token original para o Supabase validar a sessao
+  supaUrl.searchParams.set("access_token", token);
+
+  // Abre ligacao WebSocket ao Supabase
+  const supabaseResponse = await fetch(supaUrl.toString(), {
+    headers: { Upgrade: "websocket" }
+  });
+
+  if (supabaseResponse.status !== 101) {
+    return new Response("Falha ao ligar ao Supabase Realtime", { status: 502 });
+  }
+
+  // Cria par WebSocket
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+
+  const supabaseWs = supabaseResponse.webSocket;
+  supabaseWs.accept();
+
+  // Reencaminha mensagens cliente <-> supabase
+  server.addEventListener("message", (event) => {
+    try {
+      supabaseWs.send(event.data);
+    } catch (e) {}
+  });
+
+  supabaseWs.addEventListener("message", (event) => {
+    try {
+      server.send(event.data);
+    } catch (e) {}
+  });
+
+  server.addEventListener("close", () => {
+    try { supabaseWs.close(); } catch (e) {}
+  });
+
+  supabaseWs.addEventListener("close", () => {
+    try { server.close(); } catch (e) {}
+  });
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════
 
 function corsHeaders(env, request) {
-  const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+  // Inclui capacitor://localhost e file:// para WebView
+  const defaults = "https://alxmovies.netlify.app,https://alx-player.netlify.app,capacitor://localhost,http://localhost,file://";
+  const allowed = ((env.ALLOWED_ORIGINS || defaults) + "," + defaults)
+    .split(",").map(s => s.trim()).filter(Boolean);
   const origin = request?.headers.get("origin") || "";
-  const allowOrigin = allowed.length === 0 ? "*" : (allowed.includes(origin) ? origin : allowed[0]);
+  const allowOrigin = allowed.length === 0 ? "*" : (allowed.includes(origin) || origin === "" ? (origin || "*") : allowed[0]);
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS",
     "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Credentials": "true",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
   };
